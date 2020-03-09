@@ -1,0 +1,152 @@
+#
+# Docker build tools
+#
+.docker:dind:
+  services:
+    - name: docker:19.03.7-dind
+      entrypoint:
+        - /bin/sh
+        - -ec
+        - |-
+          # MTU
+          MTU=1500
+          for card in /sys/class/net/*; do
+            [ -f "$card/mtu" ] || continue
+            if [ $(cat "$card/mtu") -lt $MTU ]; then
+              MTU=$(cat "$card/mtu")
+            fi
+          done
+          echo "Using MTU: $MTU"
+          # Launch
+          exec dockerd \
+            --experimental \
+            --insecure-registry $CI_REGISTRY \
+            --log-driver none \
+            --max-concurrent-downloads $(nproc) \
+            --max-concurrent-uploads $(nproc) \
+            --mtu=$MTU \
+            --host=tcp://0.0.0.0:2375
+      alias: dockerd
+  image: docker:19.03.7
+  variables:
+    DOCKER_HOST: tcp://dockerd:2375
+    DOCKER_TLS_CERTDIR: ""
+
+.docker:gitlab-registry:
+  extends: .docker:dind
+  before_script:
+    - docker info
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+.docker:build:
+  extends: .docker:gitlab-registry
+  script:
+    - DOCKER_COMMAND='docker build --rm=false --stream'
+    # Cache
+    - |-
+      if [ -n "$DOCKER_BUILD_CACHE_IMAGES" ]; then
+        for cacheImage in $DOCKER_BUILD_CACHE_IMAGES; do
+          echo "Trying to cache from $cacheImage"
+          if docker pull "$cacheImage" > /dev/null 2>&1; then
+            echo "Cache hit"
+            DOCKER_COMMAND="$DOCKER_COMMAND --cache-from $cacheImage"
+            if [ -z "$DOCKER_BUILD_CACHE_ALL_IMAGES" ]; then
+              echo 'Stopping cache at first hit, pass DOCKER_BUILD_CACHE_ALL_IMAGES to override'
+              break
+            fi
+          else
+            echo "Cache miss"
+          fi
+        done
+      else
+        echo 'Provide DOCKER_BUILD_CACHE_IMAGES to utilize caching'
+      fi
+    # Setup variables
+    - |-
+      # Setup variables
+
+      # Context
+      if [ -z "$DOCKER_BUILD_CONTEXT_DIR" ]; then
+        DOCKER_BUILD_CONTEXT_DIR=$CI_PROJECT_DIR
+        echo "Defaulting context dir to '$DOCKER_BUILD_CONTEXT_DIR'"
+      fi
+      case "$DOCKER_BUILD_CONTEXT_DIR" in
+        /*) ;;
+        *)
+          DOCKER_BUILD_CONTEXT_DIR="$CI_PROJECT_DIR/$DOCKER_BUILD_CONTEXT_DIR"
+          if ! [ -d "$DOCKER_BUILD_CONTEXT_DIR" ]; then
+            echo "$DOCKER_BUILD_CONTEXT_DIR is not a directory!" > /dev/stderr && exit 1
+          fi
+          ;;
+      esac
+      echo "Context: '$DOCKER_BUILD_CONTEXT_DIR'"
+      ls -la "$DOCKER_BUILD_CONTEXT_DIR"
+
+      # Dockerfile
+      if [ -z "$DOCKER_BUILD_DOCKERFILE" ]; then
+        for location in \
+          "${DOCKER_BUILD_CONTEXT_DIR}/Containerfile" \
+          "${DOCKER_BUILD_CONTEXT_DIR}/Dockerfile"
+        do
+          if [ -f "$location" ]; then
+            DOCKER_BUILD_DOCKERFILE=$(basename "$location")
+            echo "Defaulting dockerfile location to '$DOCKER_BUILD_DOCKERFILE'"
+            break
+          fi
+        done
+        if [ -z "$DOCKER_BUILD_DOCKERFILE" ]; then
+          echo 'COULD NOT FIND A DOCKERFILE' > /dev/stderr && exit 1
+        fi
+        DOCKER_COMMAND="$DOCKER_COMMAND --file $DOCKER_BUILD_DOCKERFILE"
+      fi
+
+      # Target tags
+      if [ -n "$DOCKER_IMAGE_REPO" ] && [ -n "$DOCKER_IMAGE_TAGS" ]; then
+        for tag in $DOCKER_IMAGE_TAGS; do
+          DOCKER_COMMAND="$DOCKER_COMMAND --tag $DOCKER_IMAGE_REPO:$tag"
+        done
+      fi
+      for image in $DOCKER_BUILD_TARGET; do
+        DOCKER_COMMAND="$DOCKER_COMMAND --tag $image"
+      done
+
+      # Extra args
+      if [ -n "$DOCKER_BUILD_EXTRA_ARGS" ]; then
+        DOCKER_COMMAND="$DOCKER_COMMAND $DOCKER_BUILD_EXTRA_ARGS"
+      fi
+    # Build
+    - DOCKER_COMMAND="$DOCKER_COMMAND ."
+    - |-
+      echo "Command will be:"
+      echo "$DOCKER_COMMAND" | tr -s ' ' | tr ' ' '\n'
+    - cd "$DOCKER_BUILD_CONTEXT_DIR" && eval "$DOCKER_COMMAND"
+    # Push
+    - |-
+      for image in $DOCKER_BUILD_TARGET; do
+        docker push "$image"
+      done
+
+.docker:run:
+  extends: .docker:gitlab-registry
+  script:
+    - >-
+      docker run
+      --rm
+      $DOCKER_RUN_EXTRA_ARGS
+      $IMAGE
+      $DOCKER_RUN_COMMAND
+  variables:
+    GIT_STRATEGY: none
+
+.docker:retag:
+  image: registry.gitlab.com/gabibbo97/ci-stuff/k8s-tools-container
+  script:
+    - >-
+      skopeo copy
+      --src docker://$FROM --src-tls-verify=false --src-creds $FROM_USERNAME:$FROM_PASSWORD
+      --dest docker://$TO --dest-tls-verify=false --dest-creds $TO_USERNAME:$TO_PASSWORD
+  variables:
+    FROM_USERNAME: $CI_REGISTRY_USER
+    TO_USERNAME: $CI_REGISTRY_USER
+    FROM_PASSWORD: $CI_REGISTRY_PASSWORD
+    TO_PASSWORD: $CI_REGISTRY_PASSWORD

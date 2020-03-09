@@ -1,0 +1,14 @@
+stages:
+  - build
+
+containers:
+  stage: build
+  trigger:
+    include:
+      - local: /containers/.gitlab-ci.yml
+    strategy: depend
+  only:
+    changes:
+      - containers/**/*
+    refs:
+      - master
